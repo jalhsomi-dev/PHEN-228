@@ -36,22 +36,18 @@ local function getLowestY()
 	return cf.Position.Y - size.Y / 2
 end
 
--- Move the model to X/Z and then correct its Y position so the actual
--- bottom of the model sits exactly on the requested floor.
+-- Keep the model grounded using its real bounding box. The correction is
+-- calculated from the current pivot after rotation as well, so tilted
+-- movement never pushes the feet below the floor.
 local function groundModelAt(x, z, floorY)
 	local pivot = model:GetPivot()
-	local horizontalOffset = Vector3.new(
-		x - pivot.Position.X,
-		0,
-		z - pivot.Position.Z
-	)
+	model:PivotTo(CFrame.new(x, pivot.Position.Y, z) * (pivot - pivot.Position))
 
-	model:PivotTo(pivot + horizontalOffset)
+	local boxCFrame, boxSize = model:GetBoundingBox()
+	local lowestY = boxCFrame.Position.Y - boxSize.Y / 2
+	local correction = floorY - lowestY
 
-	local verticalAdjust = floorY - getLowestY()
-	if math.abs(verticalAdjust) > 0.001 then
-		model:PivotTo(model:GetPivot() + Vector3.new(0, verticalAdjust, 0))
-	end
+	model:PivotTo(model:GetPivot() + Vector3.new(0, correction, 0))
 end
 
 -- Pick the maze floor represented by a path waypoint.
@@ -145,75 +141,99 @@ local function randomDestination()
 	return Vector3.new(x, floorY + 2, z)
 end
 
--- Move along one path. Returns false if the entity appears stuck.
+-- Move along one path with deliberately unnatural, organic movement.
+-- The Boiled One should NOT look like a normal Roblox NPC.
 local function moveAlongPath(waypoints)
 	for _, waypoint in ipairs(waypoints) do
 		local targetPos = waypoint.Position
 		local floorY = getFloorYForPosition(targetPos)
-		local waypointReached = false
 		local lastCheckPosition = rootPart.Position
-		local timeSinceMovementCheck = 0
+		local checkTimer = 0
+		local waypointStart = os.clock()
 
-		while not waypointReached do
+		-- Each waypoint gets a slightly different pace so the entity doesn't
+		-- have the constant "AI motor" look.
+		local pace = EntityConfig.MoveSpeed * math.random(85, 115) / 100
+
+		while true do
 			local dt = RunService.Heartbeat:Wait()
-
 			local currentPos = rootPart.Position
-			local toTarget = targetPos - currentPos
-			local distance = toTarget.Magnitude
-
-			if distance <= 1.5 then
-				waypointReached = true
-				break
-			end
-
-			local moveDir = toTarget.Unit
-			local stepDistance = math.min(EntityConfig.MoveSpeed * dt, distance)
-			local newPos = currentPos + moveDir * stepDistance
-
-			-- Only use the waypoint for direction. The entity itself is
-			-- always grounded from its real bounding box.
-			local flatDir = Vector3.new(
+			local flatToTarget = Vector3.new(
 				targetPos.X - currentPos.X,
 				0,
 				targetPos.Z - currentPos.Z
 			)
+			local distance = flatToTarget.Magnitude
 
-			local lookCFrame
-
-			if flatDir.Magnitude > 0.05 then
-				lookCFrame = CFrame.new(newPos, newPos + flatDir)
-			else
-				lookCFrame = CFrame.new(newPos) * (rootPart.CFrame - rootPart.CFrame.Position)
+			if distance <= 1.35 then
+				break
 			end
 
-			model:PivotTo(lookCFrame)
+			-- Slow slightly near corners, then accelerate again. This avoids
+			-- perfectly constant velocity.
+			local cornerFactor = math.clamp(distance / 5, 0.45, 1)
+			local speed = pace * cornerFactor
 
-			-- Correct the vertical position after every movement step.
-			-- This prevents the model from gradually ending up inside
-			-- the floor because of its pivot/bounding-box offset.
-			local verticalAdjust = floorY - getLowestY()
+			-- Subtle irregular lateral drift makes the body feel like it is
+			-- being dragged rather than controlled by a humanoid.
+			local side = Vector3.new(-flatToTarget.Z, 0, flatToTarget.X)
+			if side.Magnitude > 0.01 then
+				side = side.Unit
+			end
+			local drift = math.sin(os.clock() * 3.2) * 0.28
+			local direction = (flatToTarget.Unit + side * drift * 0.18).Unit
+			local step = math.min(speed * dt, distance)
+			local newPos = currentPos + direction * step
 
-			if math.abs(verticalAdjust) > 0.001 then
-				model:PivotTo(model:GetPivot() + Vector3.new(0, verticalAdjust, 0))
+			-- Occasional tiny freezes are intentional: the entity pauses for
+			-- fractions of a second, then resumes suddenly.
+			local t = os.clock() - waypointStart
+			local freezeWave = math.sin(t * 0.43 + 1.7)
+			if freezeWave > 0.997 then
+				newPos = currentPos
 			end
 
-			-- Stuck detection: if almost no horizontal movement happened
-			-- for a full second, abandon this path and recalculate.
-			timeSinceMovementCheck += dt
+			local flatDir = flatToTarget.Magnitude > 0.05 and flatToTarget.Unit or rootPart.CFrame.LookVector
+			local look = CFrame.lookAt(newPos, newPos + flatDir)
 
-			if timeSinceMovementCheck >= 1 then
-				local movementSinceCheck = (
-					Vector3.new(rootPart.Position.X, 0, rootPart.Position.Z)
-					- Vector3.new(lastCheckPosition.X, 0, lastCheckPosition.Z)
-				).Magnitude
+			-- Procedural tilt: tiny pitch/roll changes give the model a
+			-- disturbing "wrong" posture without requiring an animation.
+			local pitch = math.sin(t * 2.1) * math.rad(2.2)
+			local roll = math.sin(t * 2.8 + 0.8) * math.rad(3.0)
+			local yawJitter = math.sin(t * 4.7) * math.rad(1.2)
+			look = look * CFrame.Angles(pitch, yawJitter, roll)
+			model:PivotTo(look)
 
-				if movementSinceCheck < 0.25 then
+			-- Re-ground after the tilt. This is the important part: the
+			-- lowest actual point of the model, not RootPart, determines the
+			-- floor contact.
+			local boxCFrame, boxSize = model:GetBoundingBox()
+			local lowestY = boxCFrame.Position.Y - boxSize.Y / 2
+			local correction = floorY - lowestY
+			if math.abs(correction) > 0.001 then
+				model:PivotTo(model:GetPivot() + Vector3.new(0, correction, 0))
+			end
+
+			-- Stuck detection. If the model barely changes position for a
+			-- second, abandon the current path and let the main loop recalc.
+			checkTimer += dt
+			if checkTimer >= 1 then
+				local moved = (Vector3.new(rootPart.Position.X, 0, rootPart.Position.Z)
+					- Vector3.new(lastCheckPosition.X, 0, lastCheckPosition.Z)).Magnitude
+
+				if moved < 0.2 then
 					return false
 				end
 
 				lastCheckPosition = rootPart.Position
-				timeSinceMovementCheck = 0
+				checkTimer = 0
 			end
+		end
+
+		-- A brief, irregular pause at some corners makes the wandering
+		-- pattern less predictable.
+		if math.random() < 0.28 then
+			task.wait(math.random(8, 22) / 100)
 		end
 	end
 
