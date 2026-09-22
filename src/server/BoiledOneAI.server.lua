@@ -1,14 +1,15 @@
 --[[
-	BoiledOneAI (Server)
+    PHEN-228 - The Boiled One AI
+    Server controller for the custom AnimationController/Motor6D entity.
 
-	Gives TheBoiledOne free-roam wandering across both floors of the
-	maze. The model has no Humanoid, so movement is driven manually
-	with PathfindingService + Model:PivotTo().
-
-	Movement is grounded from the model's actual bounding box so the
-	entity's feet stay on the floor instead of sinking through it.
-	The controller also detects when the entity gets stuck and lets
-	the main loop recalculate a fresh path.
+    Design:
+    - RootPart is the only part used for navigation.
+    - The imported rig's pivot is exactly its RootPart.
+    - The visible model reaches the floor while RootPart sits ~4.67 studs above it.
+    - No bounding-box grounding is performed during movement.
+    - Pathfinding handles maze navigation.
+    - Movement is deliberately imperfect and unsettling.
+    - Motor6D animation is kept separate from navigation.
 ]]
 
 local PathfindingService = game:GetService("PathfindingService")
@@ -20,67 +21,92 @@ local GameConfig = require(ReplicatedStorage:WaitForChild("GameConfig"))
 local EntityConfig = GameConfig.Entity
 
 local model = workspace:WaitForChild(EntityConfig.ModelName)
-local rootPart = model.PrimaryPart or model:WaitForChild("RootPart")
+local rootPart = model:WaitForChild("RootPart")
 
--- Anchor everything so scripted movement is stable and isn't fought by
--- physics (gravity, players bumping into it, etc.).
-for _, part in ipairs(model:GetDescendants()) do
-	if part:IsA("BasePart") then
-		part.Anchored = true
-	end
+model.PrimaryPart = rootPart
+
+-- ============================================================
+-- RIG SETUP
+-- ============================================================
+
+-- This imported rig is manually moved, so physics must not fight us.
+for _, object in ipairs(model:GetDescendants()) do
+    if object:IsA("BasePart") then
+        object.Anchored = true
+        object.CanTouch = false
+    end
 end
 
--- Return the lowest point of the model's current bounding box.
-local function getLowestY()
-	local cf, size = model:GetBoundingBox()
-	return cf.Position.Y - size.Y / 2
+-- Capture the rig's intended root height above its floor.
+-- Measurements from the imported asset show:
+-- RootPart Y ~= 4.671 when the visible bottom is at floor Y=0.
+local function getRootFloorOffset(floorY)
+    return rootPart.Position.Y - floorY
 end
 
--- Keep the model grounded using its real bounding box. The correction is
--- calculated from the current pivot after rotation as well, so tilted
--- movement never pushes the feet below the floor.
-local function groundModelAt(x, z, floorY)
-	local pivot = model:GetPivot()
-	model:PivotTo(CFrame.new(x, pivot.Position.Y, z) * (pivot - pivot.Position))
+local rootFloorOffset = getRootFloorOffset(EntityConfig.FloorYLevels[1])
 
-	local boxCFrame, boxSize = model:GetBoundingBox()
-	local lowestY = boxCFrame.Position.Y - boxSize.Y / 2
-	local correction = floorY - lowestY
-
-	model:PivotTo(model:GetPivot() + Vector3.new(0, correction, 0))
+if rootFloorOffset < 0.5 then
+    rootFloorOffset = 4.671
 end
 
--- Pick the maze floor represented by a path waypoint.
-local function getFloorYForPosition(position)
-	local closestFloor = EntityConfig.FloorYLevels[1]
-	local closestDifference = math.abs(position.Y - closestFloor)
+-- ============================================================
+-- FLOOR HELPERS
+-- ============================================================
 
-	for i = 2, #EntityConfig.FloorYLevels do
-		local floorY = EntityConfig.FloorYLevels[i]
-		local difference = math.abs(position.Y - floorY)
+local function nearestFloorY(y)
+    local best = EntityConfig.FloorYLevels[1]
+    local bestDistance = math.abs(y - best)
 
-		if difference < closestDifference then
-			closestFloor = floorY
-			closestDifference = difference
-		end
-	end
+    for i = 2, #EntityConfig.FloorYLevels do
+        local floorY = EntityConfig.FloorYLevels[i]
+        local distance = math.abs(y - floorY)
 
-	return closestFloor
+        if distance < bestDistance then
+            best = floorY
+            bestDistance = distance
+        end
+    end
+
+    return best
 end
 
--- ===== Spawn at the corner farthest from the player safe room =====
+local function rootHeightForFloor(floorY)
+    return floorY + rootFloorOffset
+end
+
+-- ============================================================
+-- SPAWN
+-- ============================================================
+
+local function placeAt(x, z, floorY, faceDirection)
+    local position = Vector3.new(x, rootHeightForFloor(floorY), z)
+
+    local direction = faceDirection
+    if not direction or direction.Magnitude < 0.001 then
+        direction = Vector3.new(0, 0, -1)
+    end
+
+    direction = Vector3.new(direction.X, 0, direction.Z).Unit
+
+    model:PivotTo(CFrame.lookAt(position, position + direction))
+end
+
 local farX = (EntityConfig.GridSize - 1) * EntityConfig.CellSize + EntityConfig.CellSize / 2
 local farZ = (EntityConfig.GridSize - 1) * EntityConfig.CellSize + EntityConfig.CellSize / 2
 
-groundModelAt(farX, farZ, EntityConfig.FloorYLevels[1])
+placeAt(farX, farZ, EntityConfig.FloorYLevels[1], Vector3.new(-1, 0, -1))
 
--- ===== Proximity sound =====
+-- ============================================================
+-- PROXIMITY AUDIO
+-- ============================================================
+
 local sound = rootPart:FindFirstChild("ProximitySound")
 
 if not sound then
-	sound = Instance.new("Sound")
-	sound.Name = "ProximitySound"
-	sound.Parent = rootPart
+    sound = Instance.new("Sound")
+    sound.Name = "ProximitySound"
+    sound.Parent = rootPart
 end
 
 sound.SoundId = EntityConfig.ProximitySoundId
@@ -92,171 +118,249 @@ sound.Volume = 1
 sound.Playing = false
 
 local function nearestPlayerDistance()
-	local closest = math.huge
+    local nearest = math.huge
+    local entityPosition = rootPart.Position
 
-	for _, player in ipairs(Players:GetPlayers()) do
-		local character = player.Character
-		local hrp = character and character:FindFirstChild("HumanoidRootPart")
+    for _, player in ipairs(Players:GetPlayers()) do
+        local character = player.Character
+        local playerRoot = character and character:FindFirstChild("HumanoidRootPart")
 
-		if hrp then
-			local dist = (hrp.Position - rootPart.Position).Magnitude
+        if playerRoot then
+            local distance = (playerRoot.Position - entityPosition).Magnitude
 
-			if dist < closest then
-				closest = dist
-			end
-		end
-	end
+            if distance < nearest then
+                nearest = distance
+            end
+        end
+    end
 
-	return closest
+    return nearest
 end
 
 task.spawn(function()
-	while true do
-		local dist = nearestPlayerDistance()
+    while model.Parent do
+        local distance = nearestPlayerDistance()
 
-		if not sound.IsPlaying and dist <= EntityConfig.ProximityTriggerDistance then
-			sound:Play()
-		elseif sound.IsPlaying and dist >= EntityConfig.ProximityStopDistance then
-			sound:Stop()
-		end
+        if distance <= EntityConfig.ProximityTriggerDistance then
+            if not sound.IsPlaying then
+                sound:Play()
+            end
+        elseif distance >= EntityConfig.ProximityStopDistance then
+            if sound.IsPlaying then
+                sound:Stop()
+            end
+        end
 
-		task.wait(0.3)
-	end
+        task.wait(0.2)
+    end
 end)
 
--- ===== Free-roam wandering =====
+-- ============================================================
+-- PATHFINDING
+-- ============================================================
+
 local agentParams = {
-	AgentHeight = EntityConfig.AgentHeight,
-	AgentRadius = EntityConfig.AgentRadius,
-	AgentCanJump = false,
-	AgentCanClimb = true,
-	WaypointSpacing = 4,
+    AgentHeight = EntityConfig.AgentHeight,
+    AgentRadius = EntityConfig.AgentRadius,
+    AgentCanJump = false,
+    AgentCanClimb = true,
+    WaypointSpacing = 4,
 }
 
 local function randomDestination()
-	local x = math.random(0, EntityConfig.GridSize - 1) * EntityConfig.CellSize + EntityConfig.CellSize / 2
-	local z = math.random(0, EntityConfig.GridSize - 1) * EntityConfig.CellSize + EntityConfig.CellSize / 2
-	local floorY = EntityConfig.FloorYLevels[math.random(1, #EntityConfig.FloorYLevels)]
+    local x = math.random(0, EntityConfig.GridSize - 1) * EntityConfig.CellSize
+        + EntityConfig.CellSize / 2
 
-	return Vector3.new(x, floorY + 2, z)
+    local z = math.random(0, EntityConfig.GridSize - 1) * EntityConfig.CellSize
+        + EntityConfig.CellSize / 2
+
+    local floorY = EntityConfig.FloorYLevels[
+        math.random(1, #EntityConfig.FloorYLevels)
+    ]
+
+    return Vector3.new(x, floorY + 1, z)
 end
 
--- Move along one path.
--- IMPORTANT: this rig is not a humanoid. Its RootPart sits ~4.67 studs
--- above the floor while the visual body reaches the floor. We therefore
--- move the model horizontally without repeatedly re-grounding/tilting it.
--- Creepy motion should come from the Motor6Ds/animation layer, not from
--- physically pitching the entire model into the floor.
-local function moveAlongPath(waypoints)
-	for _, waypoint in ipairs(waypoints) do
-		local targetPos = waypoint.Position
-		local floorY = getFloorYForPosition(targetPos)
-		local lastCheckPosition = rootPart.Position
-		local checkTimer = 0
-		local elapsed = 0
+local function computePath(destination)
+    local path = PathfindingService:CreatePath(agentParams)
 
-		-- Preserve the rig's real root-to-floor relationship. For this
-		-- imported Boiled One rig, the root is above the visible bottom.
-		local rootFloorOffset = rootPart.Position.Y - floorY
-		if rootFloorOffset < 0.5 then
-			rootFloorOffset = 4.67
-		end
+    local success = pcall(function()
+        path:ComputeAsync(rootPart.Position, destination)
+    end)
 
-		local pace = EntityConfig.MoveSpeed * math.random(82, 112) / 100
+    if not success or path.Status ~= Enum.PathStatus.Success then
+        return nil
+    end
 
-		while true do
-			local dt = RunService.Heartbeat:Wait()
-			elapsed += dt
+    local waypoints = path:GetWaypoints()
 
-			local currentRoot = rootPart.Position
-			local flatTarget = Vector3.new(targetPos.X, 0, targetPos.Z)
-			local flatCurrent = Vector3.new(currentRoot.X, 0, currentRoot.Z)
-			local toTarget = flatTarget - flatCurrent
-			local distance = toTarget.Magnitude
+    if #waypoints < 2 then
+        return nil
+    end
 
-			if distance <= 1.1 then
-				break
-			end
-
-			local direction = toTarget.Unit
-
-			-- Uneven acceleration/deceleration instead of a constant NPC speed.
-			local speedWave = 0.88 + math.sin(elapsed * 1.7 + waypoint.Position.X) * 0.10
-			local cornerFactor = math.clamp(distance / 4, 0.55, 1)
-			local speed = pace * speedWave * cornerFactor
-
-			-- Very subtle sideways wandering. This changes the path slightly
-			-- without rotating/tilting the actual body into the floor.
-			local side = Vector3.new(-direction.Z, 0, direction.X)
-			local drift = math.sin(elapsed * 2.4 + waypoint.Position.Z) * 0.10
-			local movementDirection = (direction + side * drift).Unit
-			local step = math.min(speed * dt, distance)
-
-			-- Rare micro-pauses make the entity feel less machine-perfect.
-			local freeze = math.sin(elapsed * 0.37 + 2.1) > 0.999
-			if not freeze then
-				local newXZ = flatCurrent + movementDirection * step
-
-				-- Keep the root at the correct height above whichever floor
-				-- this waypoint belongs to.
-				local newRootPosition = Vector3.new(
-					newXZ.X,
-					floorY + rootFloorOffset,
-					newXZ.Z
-				)
-
-				-- Rotate only around the vertical axis. NO pitch/roll and NO
-				-- bounding-box correction every frame, so the monster cannot
-				-- be shoved through the floor by its tilted bounding box.
-				local lookDirection = movementDirection
-				local targetCFrame = CFrame.lookAt(newRootPosition, newRootPosition + lookDirection)
-				model:PivotTo(targetCFrame)
-			end
-
-			checkTimer += dt
-			if checkTimer >= 1 then
-				local moved = (
-					Vector3.new(rootPart.Position.X, 0, rootPart.Position.Z)
-					- Vector3.new(lastCheckPosition.X, 0, lastCheckPosition.Z)
-				).Magnitude
-
-				if moved < 0.2 then
-					return false
-				end
-
-				lastCheckPosition = rootPart.Position
-				checkTimer = 0
-			end
-		end
-
-		-- Occasional longer pauses at waypoints.
-		if math.random() < 0.24 then
-			task.wait(math.random(10, 30) / 100)
-		end
-	end
-
-	return true
+    return path, waypoints
 end
 
--- ===== Main AI loop =====
-while true do
-	local destination = randomDestination()
-	local path = PathfindingService:CreatePath(agentParams)
+-- ============================================================
+-- UNSETTLING MOVEMENT
+-- ============================================================
 
-	local ok = pcall(function()
-		path:ComputeAsync(rootPart.Position, destination)
-	end)
+local function moveToWaypoint(targetPosition, floorY)
+    local startPosition = rootPart.Position
 
-	if ok and path.Status == Enum.PathStatus.Success then
-		local waypoints = path:GetWaypoints()
+    local targetXZ = Vector3.new(targetPosition.X, 0, targetPosition.Z)
+    local currentXZ = Vector3.new(startPosition.X, 0, startPosition.Z)
 
-		if #waypoints > 0 then
-			moveAlongPath(waypoints)
-		end
-	else
-		task.wait(0.5)
-	end
+    local initialDistance = (targetXZ - currentXZ).Magnitude
 
-	-- Short pause makes the wandering feel less robotic.
-	task.wait(math.random(1, 3))
+    if initialDistance < 0.75 then
+        return true
+    end
+
+    local travelTime = 0
+    local stuckTime = 0
+    local lastPosition = rootPart.Position
+
+    -- Every waypoint gets its own personality.
+    local baseSpeed = EntityConfig.MoveSpeed * math.random(88, 108) / 100
+    local swayStrength = math.random(2, 7) / 100
+    local swayFrequency = math.random(14, 25) / 10
+    local phase = math.random() * math.pi * 2
+
+    -- The entity occasionally has a moment where it seems to hesitate.
+    local hesitation = math.random() < 0.18
+    local hesitationTime = math.random(8, 20) / 100
+    local hesitationAt = math.random(25, 70) / 100
+
+    while model.Parent do
+        local dt = RunService.Heartbeat:Wait()
+        travelTime += dt
+
+        local currentRoot = rootPart.Position
+        currentXZ = Vector3.new(currentRoot.X, 0, currentRoot.Z)
+
+        local offset = targetXZ - currentXZ
+        local distance = offset.Magnitude
+
+        if distance <= 0.85 then
+            return true
+        end
+
+        local direction = offset.Unit
+        local side = Vector3.new(-direction.Z, 0, direction.X)
+
+        -- Organic-looking lateral drift.
+        local sway = math.sin(travelTime * swayFrequency + phase) * swayStrength
+
+        -- Speed breathes instead of remaining perfectly constant.
+        local speedPulse = 0.94 + math.sin(travelTime * 1.9 + phase) * 0.08
+
+        -- Slow down naturally as the entity reaches a corner.
+        local cornerSlowdown = math.clamp(distance / 3.5, 0.55, 1)
+
+        local speed = baseSpeed * speedPulse * cornerSlowdown
+
+        -- Brief hesitation. It stops without snapping into a robotic idle.
+        local hesitating = hesitation
+            and travelTime >= hesitationAt
+            and travelTime <= hesitationAt + hesitationTime
+
+        if not hesitating then
+            local movement = (direction + side * sway).Unit
+            local step = math.min(speed * dt, distance)
+
+            local nextXZ = currentXZ + movement * step
+
+            -- Keep RootPart at the correct height for the floor.
+            local nextPosition = Vector3.new(
+                nextXZ.X,
+                rootHeightForFloor(floorY),
+                nextXZ.Z
+            )
+
+            -- Rotate only around Y. The body itself will later be animated
+            -- through its Motor6Ds rather than pitching the whole rig.
+            local facing = movement
+
+            -- A tiny, slow directional imperfection prevents perfect NPC turns.
+            local yawOffset = math.sin(travelTime * 2.1 + phase) * 0.035
+            local facingCF = CFrame.lookAt(
+                nextPosition,
+                nextPosition + facing
+            ) * CFrame.Angles(0, yawOffset, 0)
+
+            model:PivotTo(facingCF)
+        end
+
+        -- Stuck detection.
+        stuckTime += dt
+
+        if stuckTime >= 0.75 then
+            local moved = (
+                Vector3.new(rootPart.Position.X, 0, rootPart.Position.Z)
+                - Vector3.new(lastPosition.X, 0, lastPosition.Z)
+            ).Magnitude
+
+            if moved < 0.12 and not hesitating then
+                return false
+            end
+
+            lastPosition = rootPart.Position
+            stuckTime = 0
+        end
+    end
+
+    return false
+end
+
+local function followPath(waypoints)
+    for index = 2, #waypoints do
+        local waypoint = waypoints[index]
+        local floorY = nearestFloorY(waypoint.Position.Y)
+
+        local reached = moveToWaypoint(waypoint.Position, floorY)
+
+        if not reached then
+            return false
+        end
+
+        -- Unpredictable micro-pauses at some corners.
+        if index < #waypoints and math.random() < 0.12 then
+            task.wait(math.random(5, 18) / 100)
+        end
+    end
+
+    return true
+end
+
+-- ============================================================
+-- MAIN WANDER LOOP
+-- ============================================================
+
+while model.Parent do
+    local destination = randomDestination()
+    local path, waypoints = computePath(destination)
+
+    if path and waypoints then
+        local blocked = false
+        local connection
+
+        connection = path.Blocked:Connect(function(blockedWaypoint)
+            if blockedWaypoint >= 2 then
+                blocked = true
+            end
+        end)
+
+        if not blocked then
+            followPath(waypoints)
+        end
+
+        if connection then
+            connection:Disconnect()
+        end
+    end
+
+    -- Not every decision happens immediately. The small delay makes
+    -- wandering feel intentional rather than like a pathfinding loop.
+    task.wait(math.random(20, 60) / 100)
 end
