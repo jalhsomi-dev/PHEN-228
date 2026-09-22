@@ -141,85 +141,84 @@ local function randomDestination()
 	return Vector3.new(x, floorY + 2, z)
 end
 
--- Move along one path with deliberately unnatural, organic movement.
--- The Boiled One should NOT look like a normal Roblox NPC.
+-- Move along one path.
+-- IMPORTANT: this rig is not a humanoid. Its RootPart sits ~4.67 studs
+-- above the floor while the visual body reaches the floor. We therefore
+-- move the model horizontally without repeatedly re-grounding/tilting it.
+-- Creepy motion should come from the Motor6Ds/animation layer, not from
+-- physically pitching the entire model into the floor.
 local function moveAlongPath(waypoints)
 	for _, waypoint in ipairs(waypoints) do
 		local targetPos = waypoint.Position
 		local floorY = getFloorYForPosition(targetPos)
 		local lastCheckPosition = rootPart.Position
 		local checkTimer = 0
-		local waypointStart = os.clock()
+		local elapsed = 0
 
-		-- Each waypoint gets a slightly different pace so the entity doesn't
-		-- have the constant "AI motor" look.
-		local pace = EntityConfig.MoveSpeed * math.random(85, 115) / 100
+		-- Preserve the rig's real root-to-floor relationship. For this
+		-- imported Boiled One rig, the root is above the visible bottom.
+		local rootFloorOffset = rootPart.Position.Y - floorY
+		if rootFloorOffset < 0.5 then
+			rootFloorOffset = 4.67
+		end
+
+		local pace = EntityConfig.MoveSpeed * math.random(82, 112) / 100
 
 		while true do
 			local dt = RunService.Heartbeat:Wait()
-			local currentPos = rootPart.Position
-			local flatToTarget = Vector3.new(
-				targetPos.X - currentPos.X,
-				0,
-				targetPos.Z - currentPos.Z
-			)
-			local distance = flatToTarget.Magnitude
+			elapsed += dt
 
-			if distance <= 1.35 then
+			local currentRoot = rootPart.Position
+			local flatTarget = Vector3.new(targetPos.X, 0, targetPos.Z)
+			local flatCurrent = Vector3.new(currentRoot.X, 0, currentRoot.Z)
+			local toTarget = flatTarget - flatCurrent
+			local distance = toTarget.Magnitude
+
+			if distance <= 1.1 then
 				break
 			end
 
-			-- Slow slightly near corners, then accelerate again. This avoids
-			-- perfectly constant velocity.
-			local cornerFactor = math.clamp(distance / 5, 0.45, 1)
-			local speed = pace * cornerFactor
+			local direction = toTarget.Unit
 
-			-- Subtle irregular lateral drift makes the body feel like it is
-			-- being dragged rather than controlled by a humanoid.
-			local side = Vector3.new(-flatToTarget.Z, 0, flatToTarget.X)
-			if side.Magnitude > 0.01 then
-				side = side.Unit
-			end
-			local drift = math.sin(os.clock() * 3.2) * 0.28
-			local direction = (flatToTarget.Unit + side * drift * 0.18).Unit
+			-- Uneven acceleration/deceleration instead of a constant NPC speed.
+			local speedWave = 0.88 + math.sin(elapsed * 1.7 + waypoint.Position.X) * 0.10
+			local cornerFactor = math.clamp(distance / 4, 0.55, 1)
+			local speed = pace * speedWave * cornerFactor
+
+			-- Very subtle sideways wandering. This changes the path slightly
+			-- without rotating/tilting the actual body into the floor.
+			local side = Vector3.new(-direction.Z, 0, direction.X)
+			local drift = math.sin(elapsed * 2.4 + waypoint.Position.Z) * 0.10
+			local movementDirection = (direction + side * drift).Unit
 			local step = math.min(speed * dt, distance)
-			local newPos = currentPos + direction * step
 
-			-- Occasional tiny freezes are intentional: the entity pauses for
-			-- fractions of a second, then resumes suddenly.
-			local t = os.clock() - waypointStart
-			local freezeWave = math.sin(t * 0.43 + 1.7)
-			if freezeWave > 0.997 then
-				newPos = currentPos
+			-- Rare micro-pauses make the entity feel less machine-perfect.
+			local freeze = math.sin(elapsed * 0.37 + 2.1) > 0.999
+			if not freeze then
+				local newXZ = flatCurrent + movementDirection * step
+
+				-- Keep the root at the correct height above whichever floor
+				-- this waypoint belongs to.
+				local newRootPosition = Vector3.new(
+					newXZ.X,
+					floorY + rootFloorOffset,
+					newXZ.Z
+				)
+
+				-- Rotate only around the vertical axis. NO pitch/roll and NO
+				-- bounding-box correction every frame, so the monster cannot
+				-- be shoved through the floor by its tilted bounding box.
+				local lookDirection = movementDirection
+				local targetCFrame = CFrame.lookAt(newRootPosition, newRootPosition + lookDirection)
+				model:PivotTo(targetCFrame)
 			end
 
-			local flatDir = flatToTarget.Magnitude > 0.05 and flatToTarget.Unit or rootPart.CFrame.LookVector
-			local look = CFrame.lookAt(newPos, newPos + flatDir)
-
-			-- Procedural tilt: tiny pitch/roll changes give the model a
-			-- disturbing "wrong" posture without requiring an animation.
-			local pitch = math.sin(t * 2.1) * math.rad(2.2)
-			local roll = math.sin(t * 2.8 + 0.8) * math.rad(3.0)
-			local yawJitter = math.sin(t * 4.7) * math.rad(1.2)
-			look = look * CFrame.Angles(pitch, yawJitter, roll)
-			model:PivotTo(look)
-
-			-- Re-ground after the tilt. This is the important part: the
-			-- lowest actual point of the model, not RootPart, determines the
-			-- floor contact.
-			local boxCFrame, boxSize = model:GetBoundingBox()
-			local lowestY = boxCFrame.Position.Y - boxSize.Y / 2
-			local correction = floorY - lowestY
-			if math.abs(correction) > 0.001 then
-				model:PivotTo(model:GetPivot() + Vector3.new(0, correction, 0))
-			end
-
-			-- Stuck detection. If the model barely changes position for a
-			-- second, abandon the current path and let the main loop recalc.
 			checkTimer += dt
 			if checkTimer >= 1 then
-				local moved = (Vector3.new(rootPart.Position.X, 0, rootPart.Position.Z)
-					- Vector3.new(lastCheckPosition.X, 0, lastCheckPosition.Z)).Magnitude
+				local moved = (
+					Vector3.new(rootPart.Position.X, 0, rootPart.Position.Z)
+					- Vector3.new(lastCheckPosition.X, 0, lastCheckPosition.Z)
+				).Magnitude
 
 				if moved < 0.2 then
 					return false
@@ -230,10 +229,9 @@ local function moveAlongPath(waypoints)
 			end
 		end
 
-		-- A brief, irregular pause at some corners makes the wandering
-		-- pattern less predictable.
-		if math.random() < 0.28 then
-			task.wait(math.random(8, 22) / 100)
+		-- Occasional longer pauses at waypoints.
+		if math.random() < 0.24 then
+			task.wait(math.random(10, 30) / 100)
 		end
 	end
 
